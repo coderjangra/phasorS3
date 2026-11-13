@@ -1,121 +1,143 @@
 # ⚡ Project Phasor S3
 
-> An edge-computing wireless signal intelligence & rogue device detection appliance powered by ESP32-S3 and backed by academic research, featuring a zero-backend React Web Serial dashboard.
+> An edge-computing wireless signal-intelligence & rogue-device detection appliance powered by the ESP32-S3, paired with a real-time React command center that connects over Wi-Fi + WebSocket and performs rogue-AP / anomaly analytics in the browser.
 
 ![Hardware Platform](https://img.shields.io/badge/Hardware-ESP32--S3%20(N8R8)-blue?style=for-the-badge&logo=espressif)
 ![Firmware](https://img.shields.io/badge/Firmware-C%2B%2B%20%2F%20Arduino-00599C?style=for-the-badge&logo=c%2B%2B)
-![Frontend](https://img.shields.io/badge/Dashboard-React%20%2B%20Tailwind-61DAFB?style=for-the-badge&logo=react)
-![Protocol](https://img.shields.io/badge/Transport-Web%20Serial%20API-emerald?style=for-the-badge)
+![Frontend](https://img.shields.io/badge/Dashboard-React%20%2B%20MUI-61DAFB?style=for-the-badge&logo=react)
+![Transport](https://img.shields.io/badge/Transport-Wi--Fi%20%2F%20WebSocket-emerald?style=for-the-badge)
 
 ---
 
 ## 📌 Executive Summary
 
-**Project Phasor S3** transitions traditional wireless auditing away from bulky, power-hungry desktop setups into a covert, highly portable hardware appliance. Operating on the dual-core **Freenove ESP32-S3 (N8R8)**, the device executes passive 2.4 GHz 802.11 spectrum analysis, Bluetooth Low Energy (BLE) proximity tracking, and EAPOL handshake monitoring. 
+**Project Phasor S3** packages 2.4 GHz 802.11 spectrum analysis, Bluetooth Low Energy (BLE)
+proximity tracking, and EAPOL handshake monitoring into a compact, dual-core **Freenove
+ESP32-S3 (N8R8)** appliance. The device exposes its own Wi-Fi access point and streams
+structured telemetry over a WebSocket to a browser-based **React Command Center**, which runs
+the project's rogue-AP and anomaly detection analytics live, on-device-independent, in the
+browser.
 
-Instead of relying strictly on easily forged MAC addresses, the system's detection logic is grounded in peer-reviewed academic research—leveraging multi-subset RSSI spatial consistency, channel state telemetry, and temporal feature profiling to isolate rogue Access Points (APs) and spoofed endpoints in real time.
+Detection logic is grounded in peer-reviewed research — multi-subset RSSI spatial consistency,
+channel/physical-layer characteristics, and temporal feature profiling — to isolate rogue APs,
+evil twins, and spoofed endpoints rather than trusting easily-forged MAC addresses.
 
 ---
 
-## 🔬 Theoretical Grounding & Academic Citations
+## 🔬 Theoretical Grounding
 
-The architecture and detection algorithms of Phasor S3 draw directly from current literature in wireless security:
+1. **Spatial Position Consistency** — *Liu & Papadimitratos (2024), "Position-based Rogue Access
+   Point Detection."* The dashboard flags APs whose RSSI footprint is statistically inconsistent
+   with a single fixed transmitter, and SSIDs cloned across multiple BSSIDs.
+2. **Physical Link & Channel Characteristics** — *McGinniss (2023), "The Identification of Rogue
+   Access Points Using Channel State Information."* A single BSSID beaconing across multiple
+   channels, or an auth downgrade for a known SSID, is surfaced as a rogue indicator.
+3. **Statistical / Temporal Feature Profiling** — *Halder et al., "SmartLens" (IEEE CNS 2023).*
+   Probe-request fan-out and deauthentication-frame bursts are profiled against baseline behavior
+   to raise probe-flood, karma, and deauth-flood alerts.
 
-1. **Spatial Position Consistency**
-   * *Paper:* **"Position-based Rogue Access Point Detection"** — *Wenjie Liu & Panos Papadimitratos (2024)*.
-   * *Application:* Evaluates multi-subset RSSI spatial consistency captured via promiscuous mode to flag anomalies introduced by rogue APs copying legitimate SSIDs/BSSIDs.
-
-2. **Physical Link & Channel Characteristics**
-   * *Paper:* **"The Identification of Rogue Access Points Using Channel State Information"** — *(2023)*.
-   * *Application:* Bypasses surface-level header spoofing by tracking line-of-sight signal propagation and underlying RF channel alterations.
-
-3. **Statistical Anomaly & Feature Encoding**
-   * *Paper:* **"SmartLens: Robust Detection Of Rogue Device Via Frequency Domain Features In LoRa-Enabled IIoT"** — *S. Halder et al. (IEEE CNS 2023)*.
-   * *Application:* Encodes temporal beacon intervals and probe request frequencies into structured vector caches to isolate devices deviating from baseline operational behaviors.
+These are implemented in `src/lib/analytics.ts` and run continuously over the live telemetry.
 
 ---
 
 ## 🖥️ System Architecture
 
 ```
-                       ┌─────────────────────────────────────┐
-                       │       Project Phasor S3 Hardware     │
-                       │   Freenove ESP32-S3 (8MB / 8MB)     │
-                       └──────────────────┬──────────────────┘
-                                          │
-                  ┌───────────────────────┴───────────────────────┐
-                  ▼                                               ▼
-     ┌────────────────────────┐                      ┌────────────────────────┐
-     │ 2.4 GHz Wi-Fi Radio    │                      │  BLE 5.0 Radio         │
-     │ - Promiscuous Sniffing │                      │  - Active/Passive Scan │
-     │ - EAPOL/PMKID Capture  │                      │  - Tracker Detection   │
-     └───────────┬────────────┘                      └───────────┬────────────┘
-                 │                                               │
-                 └───────────────────────┬───────────────────────┘
-                                         │ JSON / Serial Output (115200 Baud)
-                                         ▼
-                       ┌─────────────────────────────────────┐
-                       │  React Web Serial Command Center    │
-                       │  (Browser-Native / Zero-Backend)   │
-                       └─────────────────────────────────────┘
+          ┌───────────────────────────────────────────────┐
+          │            Project Phasor S3 (ESP32-S3)        │
+          │   2.4 GHz Wi-Fi radio  ·  BLE 5  ·  USB-HID    │
+          │   Promiscuous sniffing · EAPOL/PMKID capture   │
+          └───────────────┬───────────────────────────────┘
+                          │  SoftAP "Phasor-S3" @ 192.168.4.1
+                          │  WebSocket  ws://192.168.4.1/ws   { type, payload }
+                          │  Commands   WS text frame / POST /cmd
+                          ▼
+          ┌───────────────────────────────────────────────┐
+          │        React Command Center (browser)          │
+          │  Rogue-AP / evil-twin / deauth analytics       │
+          │  Spectrum · RSSI timelines · threat feed        │
+          │  Handshake export · session recording · demo   │
+          └───────────────────────────────────────────────┘
 ```
+
+See **[PROTOCOL.md](./PROTOCOL.md)** for the full event/command contract.
 
 ---
 
 ## ✨ Features
 
-- 🛰️ **Passive Spectrum Sweeping:** Captures 802.11 b/g/n SSIDs, BSSIDs, RSSI, channels, and security types (Open, WEP, WPA2, WPA3) without active broadcasting.
-- 📡 **BLE Proximity Hunting:** Discovers smartwatches, AirTags, headphones, and IoT beacons in physical proximity.
-- 🔐 **EAPOL & Handshake Monitoring:** Passive detection and assembly of WPA/WPA2 4-way handshakes (M1–M4) and PMKIDs for security audits.
-- 🎯 **Client Network Mapping:** Traverses probe requests and station connections to map network topology.
-- 💻 **Browser Command Center:** Zero-dependency React interface leveraging the native **Web Serial API** (`navigator.serial`) for real-time visualization and hardware control.
+### Firmware (`PhasorS3.ino`)
+- 🛰️ **Passive spectrum sweeping** — SSID/BSSID/RSSI/channel/auth enumeration.
+- 📡 **BLE proximity hunting** — active & passive scans.
+- 🔐 **EAPOL & PMKID monitoring** — assembles WPA/WPA2 4-way handshakes (M1–M4).
+- 🎯 **Client network mapping** — probe requests + station↔AP associations.
+- 🌐 **Wi-Fi command center** — SoftAP + `AsyncWebServer` + WebSocket streaming the
+  `{type,payload}` contract, plus the original interactive serial CLI (both work in parallel).
+- 🧰 Active RF tooling (deauth, beacon flood, BLE flood, USB-HID) for **authorized** testing.
+
+### Dashboard (`src/`)
+- 🚨 **Threat feed** — evil-twin, auth-downgrade, multi-channel, unstable-RSSI, karma,
+  probe-flood and deauth-flood detection, each with a severity and a "why flagged" explanation.
+- 📊 **2.4 GHz spectrum** — channel-occupancy chart; **RSSI timelines** per AP/BLE device.
+- 🗂️ **Live panels** — sortable/searchable Wi-Fi, BLE, probes, client-map, captures, sensors.
+- 🔎 **Device drawer** — per-AP signal footprint, associated clients, quick deauth/force-HS.
+- 💾 **Export** — handshakes (hashcat format), PMKIDs, alerts (CSV), full session (JSON).
+- 🧪 **Demo mode** — a built-in simulator drives the whole UI with synthetic telemetry, so you
+  can explore and present the analytics with no hardware attached.
 
 ---
 
-## 🛠️ Hardware Requirements & Pinout
+## 🛠️ Hardware
 
-* **Board:** Freenove ESP32-S3 Dev Module (N8R8) or equivalent ESP32-S3 board with PSRAM.
-* **Connection:** USB-C plugged directly into the **Native USB** port (`COM12` on Windows / `/dev/ttyACM0` on Linux).
-* **Storage (Optional Expansion):** Micro SD Card Breakout connected via SPI (`GPIO 10, 11, 12, 13`).
+* **Board:** Freenove ESP32-S3 Dev Module (N8R8) or equivalent ESP32-S3 with PSRAM.
+* **Connection:** USB-C to the **Native USB** port for flashing / serial CLI.
+* **Storage (optional):** micro-SD via SPI (`GPIO 10/11/12/13`).
 
 ---
 
-## 🚀 Quick Start Guide
+## 🚀 Quick Start
 
-### 1. ESP32-S3 Firmware Setup
-1. Open **Arduino IDE 2.x**.
-2. Go to **Preferences** and add the Espressif index URL:
-   `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
-3. Install **esp32 by Espressif Systems** via Boards Manager.
-4. Set hardware configuration:
-   * **Board:** `ESP32S3 Dev Module`
-   * **USB CDC On Boot:** `Enabled` *(Critical for Native USB communication)*
-   * **Flash Size:** `8MB`
-   * **PSRAM:** `OPI PSRAM`
-5. Flash `Phasors3.ino` to the board.
+### 1. Flash the firmware
+1. Arduino IDE 2.x → add the Espressif board index and install **esp32 by Espressif Systems**.
+2. Install libraries: **ESPAsyncWebServer** (me-no-dev fork) + **AsyncTCP**, and **ArduinoJson** (v7).
+3. Board config: `ESP32S3 Dev Module`, **USB CDC On Boot: Enabled**, Flash `8MB`, PSRAM `OPI PSRAM`.
+4. Flash `PhasorS3.ino`.
 
-### 2. Launching the React Command Center
+### 2. Launch the Command Center
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/phasor-s3.git
-cd phasor-s3/dashboard
-
-# Install dependencies
 npm install
-
-# Start local development server
 npm run dev
 ```
-Open Chrome or Edge (browsers supporting Web Serial), click **Connect ESP32**, and select your device's COM port!
+- **With hardware:** join the device's Wi-Fi AP (`Phasor-S3` / `phasor123`), open the dashboard,
+  keep mode **Live**, and confirm the device IP is `192.168.4.1`.
+- **Without hardware:** switch the header toggle to **Demo** to drive the UI from the simulator.
+
+> ⚠️ **Single-radio note:** monitor-mode channel hopping and active RF attacks temporarily take
+> over the radio and can drop the dashboard link (it auto-reconnects). Use *Continuous* scan for
+> steady live telemetry. See [PROTOCOL.md](./PROTOCOL.md#single-radio-coexistence-important).
 
 ---
 
-## 📝 License
+## 📂 Project Layout
 
-Distributed under the MIT License. See `LICENSE` for more information.
+```
+PhasorS3.ino            ESP32-S3 firmware (CLI + SoftAP/WebSocket command center)
+PROTOCOL.md             Event / command wire contract
+src/
+  types.ts              Shared data model + EventType contract
+  lib/analytics.ts      Rogue-AP / anomaly detection engine (the academic core)
+  lib/store.ts          Deduplicated, capped telemetry caches
+  lib/protocol.ts       WebSocket frame decode
+  lib/simulator.ts      Demo-mode synthetic telemetry
+  hooks/usePhasorLink.ts Live WebSocket + demo pipeline + command sender
+  components/           Header, StatCards, AlertFeed, ControlToolbar, panels, charts, drawer
+```
 
 ---
 
-## ⚠️ Disclaimer
+## 📝 License & Disclaimer
 
-*This project is designed strictly for educational purposes, academic research, and authorized enterprise security testing. Always obtain proper authorization before auditing target networks.*
+Distributed under the MIT License.
+
+*For educational purposes, academic research, and **authorized** security testing only. Always
+obtain proper authorization before auditing any network or device.*

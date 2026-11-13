@@ -6,6 +6,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <ArduinoJson.h>
+#include <ESPAsyncWebServer.h>  // me-no-dev/ESPAsyncWebServer + AsyncTCP
 #include <vector>
 #include <string.h>
 #include <stdlib.h>
@@ -30,7 +31,7 @@
 #endif
 
 // Config
-#define FW_VERSION "3.0.1-Pro"
+#define FW_VERSION "3.1.0-Web"
 #define MAX_SSID_LEN 32
 #define MAX_BEACON_SSIDS 50
 #define MAX_PROBE_CACHE 200
@@ -39,6 +40,13 @@
 #define BLE_SCAN_TIME 5
 #define BLE_FLOOD_INTERVAL_MS 30
 #define MONITOR_HOP_MS 300
+
+// --- Web / WebSocket command center (dashboard transport) ---
+#define AP_SSID "Phasor-S3"
+#define AP_PASS "phasor123"   // >= 8 chars; change before field use
+#define AP_CHANNEL 1
+#define STATUS_EMIT_MS 2000
+#define DEAUTH_RING 64
 
 // Types
 struct wifi_client_t {
@@ -68,6 +76,7 @@ struct eapol_handshake_t {
   uint8_t snonce[32];
   uint8_t mic[16];
   bool complete;
+  uint8_t emittedMask;  // last M1..M4 bitmask pushed to the dashboard
 };
 
 struct pmkid_entry_t {
@@ -111,6 +120,23 @@ std::vector<wifi_client_t> stationCache;
 std::vector<probe_device_t> probeCache;
 beacon_entry_t beaconList[MAX_BEACON_SSIDS];
 
+// --- Web command center globals ---
+AsyncWebServer httpServer(80);
+AsyncWebSocket ws("/ws");
+size_t emittedProbes = 0;
+size_t emittedStations = 0;
+uint32_t lastStatusEmit = 0;
+
+struct pending_deauth_t {
+  uint8_t ap[6];
+  uint8_t sta[6];
+  uint8_t ch;
+  uint16_t reason;
+};
+// Lock-free single-producer (promiscuous cb) / single-consumer (loop) ring.
+volatile uint8_t drHead = 0, drTail = 0;
+pending_deauth_t deauthRing[DEAUTH_RING];
+
 #define KEY_INFO_ACK (1 << 7)
 #define KEY_INFO_MIC (1 << 8)
 #define KEY_INFO_INSTALL (1 << 6)
@@ -124,6 +150,15 @@ void handleMonitorMode();
 void handleContinuousMode();
 void handleBeaconFlood();
 void handleBLEFlood();
+void scanWiFi(JsonDocument* doc);
+void scanBLE(JsonDocument* doc);
+void scanFull();
+void scanPassiveBLE();
+void showStatus();
+void setupWeb();
+void webCommand(const String& line);
+void flushTelemetry();
+void emitStatus();
 
 // Utils
 static bool parseMac(const char* s, uint8_t* out) {
@@ -376,6 +411,15 @@ void promiscuousCb(void* buf, wifi_promiscuous_pkt_type_t type) {
                   pl[10], pl[11], pl[12], pl[13], pl[14], pl[15],
                   pl[4], pl[5], pl[6], pl[7], pl[8], pl[9],
                   reason, ch);
+    // queue for the dashboard (lock-free; drop if full)
+    uint8_t nxt = (uint8_t)((drHead + 1) % DEAUTH_RING);
+    if (nxt != drTail) {
+      memcpy(deauthRing[drHead].ap, &pl[10], 6);
+      memcpy(deauthRing[drHead].sta, &pl[4], 6);
+      deauthRing[drHead].ch = ch;
+      deauthRing[drHead].reason = reason;
+      drHead = nxt;
+    }
     return;
   }
 
@@ -649,8 +693,7 @@ void scanWiFi(JsonDocument* doc) {
   if (currentMode == MODE_MONITOR) {
     esp_wifi_set_promiscuous(false);
   }
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_AP_STA);  // keep SoftAP (dashboard link) alive during scan
   delay(80);
 
   int n = WiFi.scanNetworks(false, true);
@@ -659,9 +702,11 @@ void scanWiFi(JsonDocument* doc) {
   Serial.printf("%-28s | %-17s | %4s | %3s | %s\n", "SSID", "BSSID", "RSSI", "CH", "AUTH");
   Serial.println("-----------------------------+-------------------+------+-----+----------");
 
+  // Build dashboard frame: { type: 1 (WIFI_SCAN), payload: { networks: [...] } }
   if (doc) {
-    (*doc)["type"] = "wifi_scan";
-    (*doc)["wifi"].to<JsonArray>();
+    doc->clear();
+    (*doc)["type"] = 1;
+    (*doc)["payload"]["networks"].to<JsonArray>();
   }
 
   for (int i = 0; i < n; i++) {
@@ -672,17 +717,23 @@ void scanWiFi(JsonDocument* doc) {
                   ssid.c_str(), WiFi.BSSIDstr(i).c_str(),
                   WiFi.RSSI(i), WiFi.channel(i), auth);
     if (doc) {
-      JsonArray arr = (*doc)["wifi"].as<JsonArray>();
+      JsonArray arr = (*doc)["payload"]["networks"].as<JsonArray>();
       JsonObject o = arr.add<JsonObject>();
       o["ssid"] = ssid;
       o["bssid"] = WiFi.BSSIDstr(i);
       o["rssi"] = WiFi.RSSI(i);
-      o["channel"] = WiFi.channel(i);
+      o["chan"] = WiFi.channel(i);
       o["auth"] = auth;
     }
   }
   Serial.printf("[*] %d networks\n", n);
   WiFi.scanDelete();
+
+  if (doc && ws.count() > 0) {
+    String out;
+    serializeJson(*doc, out);
+    ws.textAll(out);
+  }
 
   if (currentMode == MODE_MONITOR) {
     esp_wifi_set_promiscuous(true);
@@ -690,10 +741,35 @@ void scanWiFi(JsonDocument* doc) {
 }
 
 void scanBLE(JsonDocument* doc) {
+  // BLE shares the single 2.4 GHz radio with Wi-Fi. While the monitor
+  // promiscuous receiver is running the radio stays pinned to Wi-Fi and the
+  // BLE scan gets no airtime, so pause it for the scan (mirrors scanWiFi).
+  bool pausedPromiscuous = false;
+  if (currentMode == MODE_MONITOR) {
+    esp_wifi_set_promiscuous(false);
+    pausedPromiscuous = true;
+    delay(60);
+  }
+
+  // Guard the scan controller handle; try to rebuild it once if it is gone.
+  if (!pBLEScan) {
+    restoreBleScan();
+  }
   if (!pBLEScan) {
     Serial.println("[-] BLE not ready");
+    wsLog("[BLE] scan controller unavailable");
+    if (pausedPromiscuous) {
+      esp_wifi_set_promiscuous(true);
+    }
     return;
   }
+
+  wsLog("[BLE] scanning…");
+
+  // Drop any stale scan state before starting a fresh scan.
+  pBLEScan->stop();
+  pBLEScan->clearResults();
+
   pBLEScan->setActiveScan(true);
   BLEScanResults res = pBLEScan->start(BLE_SCAN_TIME, false);
   int n = res.getCount();
@@ -703,9 +779,11 @@ void scanBLE(JsonDocument* doc) {
   Serial.printf("%-24s | %-17s | %4s\n", "NAME", "MAC", "RSSI");
   Serial.println("-------------------------+-------------------+-----");
 
+  // Build dashboard frame: { type: 2 (BLE_SCAN), payload: { devices: [...] } }
   if (doc) {
-    (*doc)["type"] = "ble_scan";
-    (*doc)["ble"].to<JsonArray>();
+    doc->clear();
+    (*doc)["type"] = 2;
+    (*doc)["payload"]["devices"].to<JsonArray>();
   }
 
   for (int i = 0; i < n; i++) {
@@ -715,23 +793,41 @@ void scanBLE(JsonDocument* doc) {
     String name = d.haveName() ? String(d.getName().c_str()) : String("<Unknown>");
     Serial.printf("%-24.24s | %-17s | %4d\n", name.c_str(), mac.c_str(), d.getRSSI());
     if (doc) {
-      JsonArray arr = (*doc)["ble"].as<JsonArray>();
+      JsonArray arr = (*doc)["payload"]["devices"].as<JsonArray>();
       JsonObject o = arr.add<JsonObject>();
       o["name"] = name;
-      o["mac"] = mac;
+      o["addr"] = mac;
       o["rssi"] = d.getRSSI();
     }
   }
   Serial.printf("[*] %d BLE devices\n", n);
   pBLEScan->clearResults();
+
+  if (doc && ws.count() > 0) {
+    String out;
+    serializeJson(*doc, out);
+    ws.textAll(out);
+  }
+
+  // Report the result count to the dashboard log.
+  char logBuf[64];
+  snprintf(logBuf, sizeof(logBuf), "[BLE] %d devices", n);
+  wsLog(logBuf);
+  if (n == 0) {
+    wsLog("[BLE] 0 found — BLE shares the radio with Wi-Fi; stop Monitor/Continuous and rescan");
+  }
+
+  // Restore the Wi-Fi monitor receiver if we paused it for the scan.
+  if (pausedPromiscuous) {
+    esp_wifi_set_promiscuous(true);
+  }
 }
 
 void scanFull() {
-  JsonDocument doc;
-  doc["type"] = "full_scan";
-  doc["timestamp"] = millis();
-  scanWiFi(&doc);
-  scanBLE(&doc);
+  JsonDocument dw;
+  scanWiFi(&dw);
+  JsonDocument db;
+  scanBLE(&db);
 }
 
 void scanPassiveBLE() {
@@ -914,6 +1010,9 @@ void cmdHandler(const String& cmdIn) {
       pmkidCaptures.clear();
       stationCache.clear();
       probeCache.clear();
+      emittedProbes = 0;
+      emittedStations = 0;
+      drTail = drHead;
       Serial.println("[*] buffers cleared");
       break;
 
@@ -1233,6 +1332,390 @@ void handleBLEFlood() {
   }
 }
 
+// ============================================================================
+// Web command center: SoftAP + AsyncWebServer + WebSocket event stream.
+// Pushes frames shaped { "type": <EventType>, "payload": {...} } to the React
+// dashboard, and accepts single-line commands over the socket or GET/POST /cmd.
+// ============================================================================
+
+static void macToStr(const uint8_t* m, char* out) {
+  sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+static void hexEncode(const uint8_t* in, int n, char* out) {
+  for (int i = 0; i < n; i++) sprintf(out + i * 2, "%02x", in[i]);
+  out[n * 2] = 0;
+}
+static void wsSendDoc(JsonDocument& d) {
+  if (ws.count() == 0) return;
+  String out;
+  serializeJson(d, out);
+  ws.textAll(out);
+}
+
+void wsLog(const char* msg) {
+  JsonDocument d;
+  d["type"] = 8;  // LOG
+  d["payload"]["msg"] = msg;
+  wsSendDoc(d);
+}
+
+void emitStatus() {
+  int complete = 0;
+  for (auto& h : handshakes) if (h.complete) complete++;
+  JsonDocument d;
+  d["type"] = 13;  // STATUS
+  JsonObject p = d["payload"].to<JsonObject>();
+  p["mode"] = (int)currentMode;
+  p["uptime"] = millis() / 1000UL;
+  p["heap"] = ESP.getFreeHeap();
+  p["psram"] = ESP.getFreePsram();
+  p["handshakes"] = (int)handshakes.size();
+  p["complete"] = complete;
+  p["stations"] = (int)stationCache.size();
+  p["probes"] = (int)probeCache.size();
+  p["beacons"] = beaconCount;
+  p["fw"] = FW_VERSION;
+  wsSendDoc(d);
+}
+
+static void emitProbe(const probe_device_t& pd) {
+  JsonDocument d;
+  d["type"] = 3;  // PROBE
+  JsonObject p = d["payload"].to<JsonObject>();
+  char mac[18];
+  macToStr(pd.sta, mac);
+  p["mac"] = mac;
+  p["ssid"] = pd.ssid;
+  p["rssi"] = pd.rssi;
+  p["chan"] = pd.channel;
+  wsSendDoc(d);
+}
+
+static void emitStation(const wifi_client_t& sc) {
+  JsonDocument d;
+  d["type"] = 7;  // STATION
+  JsonObject p = d["payload"].to<JsonObject>();
+  char a[18], s[18];
+  macToStr(sc.ap, a);
+  macToStr(sc.sta, s);
+  p["ap"] = a;
+  p["sta"] = s;
+  p["rssi"] = sc.rssi;
+  p["chan"] = sc.channel;
+  wsSendDoc(d);
+}
+
+static void emitHandshake(const eapol_handshake_t& h) {
+  JsonDocument d;
+  d["type"] = 5;  // HANDSHAKE
+  JsonObject p = d["payload"].to<JsonObject>();
+  char a[18], s[18];
+  macToStr(h.ap, a);
+  macToStr(h.sta, s);
+  p["ap"] = a;
+  p["sta"] = s;
+  p["chan"] = h.channel;
+  p["rssi"] = h.rssi;
+  p["m1"] = h.m1;
+  p["m2"] = h.m2;
+  p["m3"] = h.m3;
+  p["m4"] = h.m4;
+  p["complete"] = h.complete;
+  if (h.complete) {
+    char an[65], sn[65], mi[33];
+    hexEncode(h.anonce, 32, an);
+    hexEncode(h.snonce, 32, sn);
+    hexEncode(h.mic, 16, mi);
+    p["anonce"] = an;
+    p["snonce"] = sn;
+    p["mic"] = mi;
+  }
+  wsSendDoc(d);
+}
+
+static void emitDeauth(const pending_deauth_t& pd) {
+  JsonDocument d;
+  d["type"] = 4;  // DEAUTH_RX
+  JsonObject p = d["payload"].to<JsonObject>();
+  char a[18], s[18];
+  macToStr(pd.ap, a);
+  macToStr(pd.sta, s);
+  p["ap"] = a;
+  p["sta"] = s;
+  p["reason"] = pd.reason;
+  p["chan"] = pd.ch;
+  wsSendDoc(d);
+}
+
+// Called every loop() iteration: streams cache deltas + periodic status.
+void flushTelemetry() {
+  if (ws.count() == 0) {
+    // No dashboard attached — keep indices current so a late client isn't
+    // flooded with the entire backlog as individual events.
+    emittedProbes = probeCache.size();
+    emittedStations = stationCache.size();
+    drTail = drHead;
+    return;
+  }
+  for (; emittedProbes < probeCache.size(); emittedProbes++) emitProbe(probeCache[emittedProbes]);
+  for (; emittedStations < stationCache.size(); emittedStations++) emitStation(stationCache[emittedStations]);
+  for (auto& h : handshakes) {
+    uint8_t m = (h.m1 ? 1 : 0) | (h.m2 ? 2 : 0) | (h.m3 ? 4 : 0) | (h.m4 ? 8 : 0);
+    if (m != h.emittedMask) {
+      h.emittedMask = m;
+      emitHandshake(h);
+    }
+  }
+  while (drTail != drHead) {
+    emitDeauth(deauthRing[drTail]);
+    drTail = (uint8_t)((drTail + 1) % DEAUTH_RING);
+  }
+  uint32_t nowMs = millis();
+  if (nowMs - lastStatusEmit > STATUS_EMIT_MS) {
+    lastStatusEmit = nowMs;
+    emitStatus();
+  }
+}
+
+static const char LANDING_HTML[] PROGMEM =
+  "<!doctype html><meta charset=utf-8><title>Phasor-S3</title>"
+  "<body style='font-family:system-ui;background:#0a0a0a;color:#d1c4e9;padding:2rem'>"
+  "<h2>&#9889; Phasor-S3 Command Center</h2>"
+  "<p>WebSocket telemetry: <code>ws://" AP_SSID ".local/ws</code> (or this device IP + <code>/ws</code>)</p>"
+  "<p>Open the React dashboard and point it at this device's IP.</p>"
+  "<p>Commands: <code>POST /cmd?c=&lt;line&gt;</code> or send over the socket.</p></body>";
+
+void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client, AwsEventType type, void* arg, uint8_t* data, size_t len) {
+  (void)server;
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[WS] client %u connected (%s)\n", client->id(), client->remoteIP().toString().c_str());
+    emitStatus();
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[WS] client %u disconnected\n", client->id());
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      String msg;
+      msg.reserve(len + 1);
+      for (size_t i = 0; i < len; i++) msg += (char)data[i];
+      webCommand(msg);
+    }
+  }
+}
+
+void setupWeb() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("[WEB] SoftAP '%s' (pass '%s') @ http://%s\n", AP_SSID, AP_PASS, ip.toString().c_str());
+
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+
+  ws.onEvent(onWsEvent);
+  httpServer.addHandler(&ws);
+
+  httpServer.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send_P(200, "text/html", LANDING_HTML);
+  });
+  httpServer.on("/cmd", HTTP_ANY, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("c")) {
+      webCommand(req->getParam("c")->value());
+      req->send(200, "text/plain", "ok");
+    } else if (req->hasParam("c", true)) {
+      webCommand(req->getParam("c", true)->value());
+      req->send(200, "text/plain", "ok");
+    } else {
+      req->send(400, "text/plain", "missing ?c=");
+    }
+  });
+  httpServer.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    emitStatus();
+    req->send(200, "text/plain", "ok");
+  });
+  httpServer.onNotFound([](AsyncWebServerRequest* req) { req->send(404, "text/plain", "not found"); });
+  httpServer.begin();
+  Serial.println("[WEB] HTTP + WebSocket server started");
+}
+
+// Single-line command grammar (dashboard + scriptable). Mirrors the serial CLI
+// without its interactive sub-prompts.
+void webCommand(const String& line) {
+  String cmd = line;
+  cmd.trim();
+  if (!cmd.length()) return;
+  Serial.printf("[WEB-CMD] %s\n", cmd.c_str());
+  char echo[96];
+  snprintf(echo, sizeof(echo), "[cmd] %s", cmd.c_str());
+  wsLog(echo);
+
+  // Multi-char commands first.
+  char a[18] = {0}, b[18] = {0}, s[33] = {0};
+  uint8_t ah[6], bh[6];
+  unsigned ch = 0, n = 0, sec = 0;
+
+  if (cmd.startsWith("DB ") || cmd.startsWith("DA ")) {
+    if (sscanf(cmd.c_str(), "%*s %17s %u %u", a, &ch, &n) >= 2 && parseMac(a, ah))
+      deauthBroadcast(ah, (uint8_t)ch, n ? (int)n : 20);
+    return;
+  }
+  if (cmd.startsWith("DS ")) {
+    if (sscanf(cmd.c_str(), "DS %17s %17s %u", a, b, &ch) == 3 && parseMac(a, ah) && parseMac(b, bh))
+      deauthTargeted(ah, bh, (uint8_t)ch, 12);
+    return;
+  }
+  if (cmd.startsWith("DF ")) {
+    if (sscanf(cmd.c_str(), "DF %17s %u %u", a, &ch, &sec) >= 2 && parseMac(a, ah))
+      forceHandshake(ah, (uint8_t)ch, sec ? (int)sec : 15);
+    return;
+  }
+  if (cmd.startsWith("PM ")) {
+    if (sscanf(cmd.c_str(), "PM %17s %u", a, &ch) == 2 && parseMac(a, ah)) pmkidCapture(ah, "x", (uint8_t)ch);
+    return;
+  }
+  if (cmd.startsWith("PS ")) {
+    if (sscanf(cmd.c_str(), "PS %17s %32s %u", a, s, &ch) == 3 && parseMac(a, ah)) pmkidCapture(ah, s, (uint8_t)ch);
+    return;
+  }
+  if (cmd.startsWith("BA ")) {
+    String ss = cmd.substring(3);
+    ss.trim();
+    if (beaconCount < MAX_BEACON_SSIDS && ss.length() > 0 && ss.length() <= MAX_SSID_LEN) {
+      ss.toCharArray(beaconList[beaconCount].ssid, MAX_SSID_LEN + 1);
+      beaconList[beaconCount].active = true;
+      beaconCount++;
+    }
+    return;
+  }
+  if (cmd.startsWith("F1 ")) {
+    char mac[18] = {0};
+    int cnt = 0;
+    uint8_t m[6];
+    if (sscanf(cmd.c_str(), "F1 %17s %d", mac, &cnt) >= 1 && parseMac(mac, m)) {
+      if (cnt < 10) cnt = 80;
+      bleFloodStart(m, cnt);
+    }
+    return;
+  }
+  if (cmd.startsWith("F2 ")) {
+    int cnt = 0;
+    if (sscanf(cmd.c_str(), "F2 %d", &cnt) == 1) bleMassFlood(cnt < 5 ? 30 : cnt);
+    return;
+  }
+
+  // Two-letter / word commands.
+  if (cmd == "BA") {  // start beacon flood from loaded list
+    if (beaconCount) {
+      wifi_config_t apcfg;
+      memset(&apcfg, 0, sizeof(apcfg));
+      strcpy((char*)apcfg.ap.ssid, "p");
+      apcfg.ap.ssid_len = 1;
+      apcfg.ap.channel = 1;
+      apcfg.ap.authmode = WIFI_AUTH_OPEN;
+      apcfg.ap.ssid_hidden = 1;
+      apcfg.ap.max_connection = 1;
+      apcfg.ap.beacon_interval = 60000;
+      WiFi.mode(WIFI_AP);
+      esp_wifi_set_config(WIFI_IF_AP, &apcfg);
+      currentMode = MODE_BEACON_FLOOD;
+      beaconTxIndex = 0;
+    }
+    return;
+  }
+  if (cmd == "BR") {
+    const char* defaults[] = {"Free Airport WiFi", "Starbucks WiFi", "ATT Wi-Fi", "Xfinity", "Guest Network"};
+    beaconCount = 0;
+    for (int i = 0; i < 5 && beaconCount < MAX_BEACON_SSIDS; i++) {
+      strncpy(beaconList[beaconCount].ssid, defaults[i], MAX_SSID_LEN);
+      beaconList[beaconCount].ssid[MAX_SSID_LEN] = 0;
+      beaconList[beaconCount].active = true;
+      beaconCount++;
+    }
+    return;
+  }
+  if (cmd == "BS") {
+    currentMode = MODE_IDLE;
+    setupWeb();  // restore dashboard SoftAP
+    return;
+  }
+  if (cmd == "BC") {
+    beaconCount = 0;
+    return;
+  }
+  if (cmd == "FS") {
+    attackRunning = false;
+    if (pBLEAdvertising) pBLEAdvertising->stop();
+    currentMode = MODE_IDLE;
+    restoreBleScan();
+    return;
+  }
+#if HAS_USB_HID
+  if (cmd == "K1" || cmd == "K2") {
+    Keyboard.begin();
+    delay(400);
+    Keyboard.press(KEY_LEFT_GUI);
+    Keyboard.write('r');
+    Keyboard.releaseAll();
+    delay(400);
+    Keyboard.print("powershell");
+    Keyboard.write(KEY_RETURN);
+    Keyboard.end();
+    return;
+  }
+#endif
+
+  // Single-character menu commands.
+  char c = cmd.charAt(0);
+  switch (c) {
+    case '1': { JsonDocument d; scanWiFi(&d); break; }
+    case '2': { JsonDocument d; scanBLE(&d); break; }
+    case '3': scanFull(); break;
+    case '4':
+      currentMode = (currentMode == MODE_CONTINUOUS_SCAN) ? MODE_IDLE : MODE_CONTINUOUS_SCAN;
+      break;
+    case '5':
+      if (currentMode == MODE_MONITOR) {
+        currentMode = MODE_IDLE;
+        esp_wifi_set_promiscuous(false);
+      } else {
+        WiFi.mode(WIFI_AP_STA);  // keep dashboard reachable; note: hopping may stutter link
+        currentMode = MODE_MONITOR;
+        currentChannel = 1;
+        esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous_rx_cb(&promiscuousCb);
+        esp_wifi_set_promiscuous(true);
+      }
+      break;
+    case '6': scanPassiveBLE(); break;
+    case '7': showStatus(); emitStatus(); break;
+    case 'C':
+    case 'c':
+      handshakes.clear();
+      pmkidCaptures.clear();
+      stationCache.clear();
+      probeCache.clear();
+      emittedProbes = 0;
+      emittedStations = 0;
+      drTail = drHead;
+      break;
+    case 'E':
+    case 'e':
+      for (auto& hs : handshakes) {
+        if (!hs.complete) continue;
+        char apS[18], staS[18], an[65], sn[65], mi[33], lineBuf[220];
+        macToStr(hs.ap, apS);
+        macToStr(hs.sta, staS);
+        hexEncode(hs.anonce, 32, an);
+        hexEncode(hs.snonce, 32, sn);
+        hexEncode(hs.mic, 16, mi);
+        snprintf(lineBuf, sizeof(lineBuf), "WPA*01*%s*%s*%s*%s*%s*", apS, staS, an, sn, mi);
+        wsLog(lineBuf);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
 // Setup / Loop
 void setup() {
   Serial.begin(115200);
@@ -1254,6 +1737,8 @@ void setup() {
 
   esp_wifi_set_promiscuous_rx_cb(&promiscuousCb);
 
+  setupWeb();  // SoftAP + HTTP + WebSocket dashboard transport
+
   Serial.printf("[*] boot OK | HS slots %d | STA slots %d\n",
                 MAX_HANDSHAKE_CACHE, MAX_STATION_CACHE);
 #if HAS_USB_HID
@@ -1265,6 +1750,9 @@ void setup() {
 }
 
 void loop() {
+  ws.cleanupClients();
+  flushTelemetry();  // stream cache deltas + periodic status to the dashboard
+
   switch (currentMode) {
     case MODE_MONITOR:
       handleMonitorMode();

@@ -1,0 +1,15 @@
+# dependencies & build output
+node_modules/
+dist/
+
+# local tooling / editor / OS
+.claude/
+.impeccable/
+.vscode/
+.DS_Store
+*.local
+
+# academic report documents & screenshots (kept off the public repo)
+*.docx
+*.pdf
+screenshots/

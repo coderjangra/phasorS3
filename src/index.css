@@ -1,0 +1,105 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+/* Glassmorphism utility classes */
+.glass-panel {
+  background: rgba(30, 20, 50, 0.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(179, 157, 219, 0.2);
+  border-radius: 16px;
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+}
+
+/* Dynamic background animation */
+.animated-bg {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: -1;
+  overflow: hidden;
+  background: #050505;
+}
+
+.animated-bg::before,
+.animated-bg::after {
+  content: "";
+  position: absolute;
+  width: 600px;
+  height: 600px;
+  border-radius: 50%;
+  filter: blur(100px);
+  opacity: 0.4;
+  animation: float 20s infinite alternate;
+}
+
+.animated-bg::before {
+  top: -100px;
+  left: -100px;
+  background: radial-gradient(circle, rgba(126,87,194,0.6) 0%, rgba(0,0,0,0) 70%);
+}
+
+.animated-bg::after {
+  bottom: -150px;
+  right: -100px;
+  background: radial-gradient(circle, rgba(101,31,255,0.4) 0%, rgba(0,0,0,0) 70%);
+  animation-delay: -10s;
+}
+
+@keyframes float {
+  0% {
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    transform: translate(50px, 30px) scale(1.1);
+  }
+  100% {
+    transform: translate(-30px, 50px) scale(0.9);
+  }
+}
+
+/* Live / sniffing pulse */
+@keyframes phasor-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(57, 135, 229, 0.5); opacity: 1; }
+  70% { box-shadow: 0 0 0 7px rgba(57, 135, 229, 0); opacity: 0.85; }
+  100% { box-shadow: 0 0 0 0 rgba(57, 135, 229, 0); opacity: 1; }
+}
+.phasor-pulse {
+  animation: phasor-pulse 1.6s infinite;
+}
+@keyframes phasor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.phasor-blink {
+  animation: phasor-blink 1.4s ease-in-out infinite;
+}
+
+/* Hopping bars for monitor mode */
+@keyframes phasor-hop {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
+}
+
+/* Respect reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  .phasor-pulse, .phasor-blink, .animated-bg::before, .animated-bg::after {
+    animation: none;
+  }
+}
